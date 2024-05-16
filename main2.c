@@ -284,8 +284,6 @@ void deleteFileFromTar(char *filename, char *tar_filename) {
 
     // Mark the entry as empty
     fatTable.entries[fileIndex].is_empty = 1;
-    // fatTable.entries[fileIndex].starting_block = 0;
-    // fatTable.entries[fileIndex].num_blocks = 0;
     fatTable.entries[fileIndex].file_size = 0;
     strcpy(fatTable.entries[fileIndex].filename, "");
 
@@ -299,7 +297,7 @@ void deleteFileFromTar(char *filename, char *tar_filename) {
 
 int main(int argc, char *argv[]) {
     int opt;
-    int create = 0, extract = 0, list = 0, delete = 0, update = 0, verbose = 0, append = 0;
+    int create = 0, extract = 0, list = 0, delete = 0, update = 0, verbose = 0, append = 0, pack = 0;
     char *tarFilename = NULL;
     char *filename = NULL;
 
@@ -327,10 +325,13 @@ int main(int argc, char *argv[]) {
                 update = 1;
                 break;
             case 'v':
-                verbose = 1;
+                verbose++;
                 break;
             case 'r':
                 append = 1;
+                break;
+            case 'p':
+                pack = 1;
                 break;
             case 'f':
                 tarFilename = optarg;
@@ -370,7 +371,7 @@ int main(int argc, char *argv[]) {
                 writeFileToTar(argv[i], tarFile, &fatTable);
             }
 
-            printFatTable(&fatTable);
+            // printFatTable(&fatTable);
 
             // Guardar la FAT table actualizada en el archivo TAR
             fseek(tarFile, 0, SEEK_SET);
@@ -395,6 +396,9 @@ int main(int argc, char *argv[]) {
     } else if (append) {
         // Implementar la función para agregar contenido a un archivo TAR
         printf("Agregar contenido al archivo TAR: %s\n", tarFilename);
+    } else if (pack) {
+        // Implementar la función para desfragmentar contenido de un archivo TAR
+        printf("Desfragmentar contenido del archivo TAR: %s\n", tarFilename);
     }
 
     return 0;
