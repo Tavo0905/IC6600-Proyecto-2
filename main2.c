@@ -7,8 +7,8 @@
 
 typedef struct FatEntry {
     char filename[12]; // 12-character filename
-    unsigned short starting_block; // Starting block number of the file
-    unsigned short num_blocks; // Number of blocks required for the file
+    unsigned int starting_block; // Starting block number of the file
+    unsigned int num_blocks; // Number of blocks required for the file
     unsigned int file_size;  // File size in bytes (added)
     unsigned char is_empty; // Empty flag (1 for empty, 0 for occupied)
 } FatEntry;
@@ -256,6 +256,46 @@ void listTar(char *tar_filename) {
     fclose(tarFile);
 }
 
+void deleteFileFromTar(char *filename, char *tar_filename) {
+    FILE *tarFile = fopen(tar_filename, "rb+");
+    if (!tarFile) {
+        printf("Error opening TAR file: %s\n", tar_filename);
+        return;
+    }
+
+    // Read and store the FAT table
+    FatTable fatTable;
+    loadFatTableFromFile(&fatTable, tarFile);
+
+    // Find the entry for the file in the FAT table
+    int fileIndex = -1;
+    for (int i = 0; i < 256; i++) {
+        if (!fatTable.entries[i].is_empty && strcmp(fatTable.entries[i].filename, filename) == 0) {
+            fileIndex = i;
+            break;
+        }
+    }
+
+    if (fileIndex == -1) {
+        printf("File not found in TAR: %s\n", filename);
+        fclose(tarFile);
+        return;
+    }
+
+    // Mark the entry as empty
+    fatTable.entries[fileIndex].is_empty = 1;
+    // fatTable.entries[fileIndex].starting_block = 0;
+    // fatTable.entries[fileIndex].num_blocks = 0;
+    fatTable.entries[fileIndex].file_size = 0;
+    strcpy(fatTable.entries[fileIndex].filename, "");
+
+    // Update the FAT table in the TAR file
+    fseek(tarFile, 0, SEEK_SET); // Rewind to the beginning of the file
+    saveFatTableToFile(&fatTable, tarFile);
+
+    fclose(tarFile);
+    printf("File deleted from TAR: %s\n", filename);
+}
 
 int main(int argc, char *argv[]) {
     int opt;
@@ -275,11 +315,14 @@ int main(int argc, char *argv[]) {
             case 't':
                 list = 1;
                 break;
-            case '-': // Manejar los flags largos (--delete)
-                if (strcmp(optarg, "delete") == 0) {
-                    delete = 1;
-                }
+            case 'd':
+                delete = 1;
                 break;
+            // case '-': // Manejar los flags largos (--delete)
+            //     if (strcmp(optarg, "delete") == 0) {
+            //         delete = 1;
+            //     }
+            //     break;
             case 'u':
                 update = 1;
                 break;
@@ -343,8 +386,9 @@ int main(int argc, char *argv[]) {
     } else if (list) {
         listTar(tarFilename);
     } else if (delete) {
+        deleteFileFromTar(argv[optind], tarFilename);
         // Implementar la función para borrar desde un archivo TAR
-        printf("Borrar desde el archivo TAR: %s\n", tarFilename);
+        // printf("Borrar desde el archivo TAR: %s\n", tarFilename);
     } else if (update) {
         // Implementar la función para actualizar el contenido del archivo TAR
         printf("Actualizar contenido del archivo TAR: %s\n", tarFilename);
