@@ -162,7 +162,6 @@ void writeFileToTar(char *filename, FILE *tarFile, FatTable *fatTable) {
     }
 
 
-    printFatTable(fatTable);
     fclose(sourceFile);
     printf("Archivo agregado al TAR: %s, Tamaño: %d bytes, Bloques iniciales: %d, Bloques: %d\n", filename, file_size, fatTable->entries[currentBlock].starting_block, num_blocks);
 }
@@ -240,6 +239,39 @@ void readTarFile(char *tarFilename) {
     fclose(tarFile);
 }
 
+void listTar(char *tar_filename) {
+    FILE *tarFile = fopen(tar_filename, "rb");
+    if (!tarFile) {
+        printf("Error opening TAR file: %s\n", tar_filename);
+        return;
+    }
+
+    // Read and store the FAT table
+    FatTable fatTable;
+    loadFatTableFromFile(&fatTable, tarFile);
+
+    // Loop through each file entry in the TAR based on FAT table
+    printf("Files in %s:\n", tar_filename);
+    printf("------------------------------------------\n");
+    printf("| %-20s | %-15s |\n", "Filename", "File Size");
+    printf("------------------------------------------\n");
+    for (int i = 0; i < 256; i++) {
+        if (fatTable.entries[i].is_empty) {
+            continue; // Skip empty FAT entries
+        }
+
+        // Extract file data based on FAT information
+        char filename[13]; // Account for null terminator
+        strncpy(filename, fatTable.entries[i].filename, 12);
+        filename[12] = '\0'; // Ensure null termination
+
+        // Print file metadata
+        printf("| %-20s | %-15d |\n", filename, fatTable.entries[i].file_size);
+    }
+    printf("------------------------------------------\n");
+
+    fclose(tarFile);
+}
 
 
 int main(int argc, char *argv[]) {
@@ -278,7 +310,7 @@ int main(int argc, char *argv[]) {
                 tarFilename = optarg;
                 break;
             default:
-                fprintf(stderr, "Uso: %s [-cxtdurv] [-f archivo_tar] [archivo]\n", argv[0]);
+                fprintf(stderr, "Uso: %s [-cxtdurv] [-f archivo_tar] [archivo(s)]\n", argv[0]);
                 return 1;
         }
     }
@@ -312,6 +344,8 @@ int main(int argc, char *argv[]) {
                 writeFileToTar(argv[i], tarFile, &fatTable);
             }
 
+            printFatTable(&fatTable);
+
             // Guardar la FAT table actualizada en el archivo TAR
             fseek(tarFile, 0, SEEK_SET);
             saveFatTableToFile(&fatTable, tarFile);
@@ -324,8 +358,7 @@ int main(int argc, char *argv[]) {
     } else if (extract) {
         readTarFile(tarFilename);
     } else if (list) {
-        // Implementar la función para listar el contenido del archivo TAR
-        printf("Listar contenido del archivo TAR: %s\n", tarFilename);
+        listTar(tarFilename);
     } else if (delete) {
         // Implementar la función para borrar desde un archivo TAR
         printf("Borrar desde el archivo TAR: %s\n", tarFilename);
