@@ -295,6 +295,80 @@ void deleteFileFromTar(char *filename, char *tar_filename) {
     printf("File deleted from TAR: %s\n", filename);
 }
 
+void updateFileFromTar(char *filename, char *tar_filename) {
+    FILE *tarFile = fopen(tar_filename, "rb+");
+    if (!tarFile) {
+        printf("Error opening TAR file: %s\n", tar_filename);
+        return;
+    }
+
+    // Read and store the FAT table
+    FatTable fatTable;
+    loadFatTableFromFile(&fatTable, tarFile);
+
+    // Find the entry for the file in the FAT table
+    int fileIndex = -1;
+    for (int i = 0; i < 256; i++) {
+        if (!fatTable.entries[i].is_empty && strcmp(fatTable.entries[i].filename, filename) == 0) {
+            fileIndex = i;
+            break;
+        }
+    }
+
+    if (fileIndex == -1) {
+        printf("File not found in TAR: %s\n", filename);
+        fclose(tarFile);
+        return;
+    }
+
+    // Open the new version of the file for updating
+    FILE *newFile = fopen(filename, "rb");
+    if (!newFile) {
+        printf("Error opening new version of the file: %s\n", filename);
+        fclose(tarFile);
+        return;
+    }
+
+    // Calculate the number of blocks required for the new file
+    fseek(newFile, 0, SEEK_END);
+    int newFileSize = ftell(newFile);
+    fseek(newFile, 0, SEEK_SET);
+    int newNumBlocks = (newFileSize + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    // Compare the number of blocks with the original file
+    if (newNumBlocks != fatTable.entries[fileIndex].num_blocks) {
+        printf("Error: The number of blocks of the new file does not match the number specified in the FAT table.\n");
+        fclose(newFile);
+        fclose(tarFile);
+        return;
+    }
+
+    // Calculate the starting block of the file
+    int startingBlock = fatTable.entries[fileIndex].starting_block;
+
+    // Move to the starting block in the TAR file
+    fseek(tarFile, sizeof(FatTable) + sizeof(TarHeader) + (startingBlock * BLOCK_SIZE), SEEK_SET);
+
+    // Update the content of the TAR file with the content of the new file
+    char buffer[BLOCK_SIZE];
+    int bytesRead;
+    while ((bytesRead = fread(buffer, 1, BLOCK_SIZE, newFile)) > 0) {
+        fwrite(buffer, 1, bytesRead, tarFile);
+    }
+
+    // Update file size in the FAT table entry
+    fatTable.entries[fileIndex].file_size = newFileSize;
+
+    // Update the FAT table in the TAR file
+    fseek(tarFile, 0, SEEK_SET); // Rewind to the beginning of the file
+    saveFatTableToFile(&fatTable, tarFile);
+
+    fclose(newFile);
+    fclose(tarFile);
+    printf("File updated in TAR: %s\n", filename);
+}
+
+
 int main(int argc, char *argv[]) {
     int opt;
     int create = 0, extract = 0, list = 0, delete = 0, update = 0, verbose = 0, append = 0, pack = 0;
@@ -391,8 +465,9 @@ int main(int argc, char *argv[]) {
         // Implementar la función para borrar desde un archivo TAR
         // printf("Borrar desde el archivo TAR: %s\n", tarFilename);
     } else if (update) {
+        updateFileFromTar(argv[optind], tarFilename);
         // Implementar la función para actualizar el contenido del archivo TAR
-        printf("Actualizar contenido del archivo TAR: %s\n", tarFilename);
+        // printf("Actualizar contenido del archivo TAR: %s\n", tarFilename);
     } else if (append) {
         // Implementar la función para agregar contenido a un archivo TAR
         printf("Agregar contenido al archivo TAR: %s\n", tarFilename);
