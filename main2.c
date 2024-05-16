@@ -58,14 +58,15 @@ void loadFatTableFromFile(FatTable *fatTable, FILE *tarFile) {
 }
 
 void printFatTable(FatTable *fatTable) {
-    printf("FAT Table:\n");
-    printf("  Filename  | Starting Block | Num Blocks | File Size | Is Empty\n");
-    printf("------------|---------------|------------|-----------|----------\n");
+    printf("-------------------------------------------------------------------------------------\n");
+    printf("| %-20s | %-12s | %-12s | %-15s | %-10s |\n", "Filename", "First Block", "Block Size", "File Size", "Is Empty");
+    printf("|----------------------|--------------|--------------|-----------------|------------|\n");
 
     for (int i = 0; i < 20; i++) {
         FatEntry entry = fatTable->entries[i];
-        printf("  %-12s | %15d | %10d | %10d | %d\n", entry.filename, entry.starting_block, entry.num_blocks, entry.file_size, entry.is_empty);
+        printf("| %-20s | %12d | %12d | %15d | %10d |\n", entry.filename, entry.starting_block, entry.num_blocks, entry.file_size, entry.is_empty);
     }
+    printf("-------------------------------------------------------------------------------------\n");
 }
 
 void createEmptyTar(char *tarFilename) {
@@ -250,25 +251,7 @@ void listTar(char *tar_filename) {
     FatTable fatTable;
     loadFatTableFromFile(&fatTable, tarFile);
 
-    // Loop through each file entry in the TAR based on FAT table
-    printf("Files in %s:\n", tar_filename);
-    printf("------------------------------------------\n");
-    printf("| %-20s | %-15s |\n", "Filename", "File Size");
-    printf("------------------------------------------\n");
-    for (int i = 0; i < 256; i++) {
-        if (fatTable.entries[i].is_empty) {
-            continue; // Skip empty FAT entries
-        }
-
-        // Extract file data based on FAT information
-        char filename[13]; // Account for null terminator
-        strncpy(filename, fatTable.entries[i].filename, 12);
-        filename[12] = '\0'; // Ensure null termination
-
-        // Print file metadata
-        printf("| %-20s | %-15d |\n", filename, fatTable.entries[i].file_size);
-    }
-    printf("------------------------------------------\n");
+    printFatTable(&fatTable);
 
     fclose(tarFile);
 }
