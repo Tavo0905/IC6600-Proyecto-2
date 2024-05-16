@@ -9,6 +9,7 @@ typedef struct FatEntry {
     char filename[12]; // 12-character filename
     unsigned short starting_block; // Starting block number of the file
     unsigned short num_blocks; // Number of blocks required for the file
+    unsigned int file_size;  // File size in bytes (added)
     unsigned char is_empty; // Empty flag (1 for empty, 0 for occupied)
 } FatEntry;
 
@@ -32,9 +33,10 @@ typedef struct TarHeader {
 void initializeFatTable(FatTable *fatTable) {
     for (int i = 0; i < 256; i++) {
         fatTable->entries[i].is_empty = 1;
-        fatTable->entries[i].starting_block = 0; // Block number is the same as the entry index
+        fatTable->entries[i].starting_block = 0;
         fatTable->entries[i].num_blocks = 0;
         strcpy(fatTable->entries[i].filename, "\0");
+        fatTable->entries[i].file_size = 0; // Initialize file size to 0 (added)
     }
 }
 
@@ -57,12 +59,12 @@ void loadFatTableFromFile(FatTable *fatTable, FILE *tarFile) {
 
 void printFatTable(FatTable *fatTable) {
     printf("FAT Table:\n");
-    printf("  Filename  | Starting Block | Num Blocks | Is Empty\n");
-    printf("------------|---------------|------------|----------\n");
+    printf("  Filename  | Starting Block | Num Blocks | File Size | Is Empty\n");
+    printf("------------|---------------|------------|-----------|----------\n");
 
     for (int i = 0; i < 20; i++) {
         FatEntry entry = fatTable->entries[i];
-        printf("  %-12s | %15d | %10d | %d\n", entry.filename, entry.starting_block, entry.num_blocks, entry.is_empty);
+        printf("  %-12s | %15d | %10d | %10d | %d\n", entry.filename, entry.starting_block, entry.num_blocks, entry.file_size, entry.is_empty);
     }
 }
 
@@ -121,7 +123,7 @@ void writeFileToTar(char *filename, FILE *tarFile, FatTable *fatTable) {
         starting_block = fatTable->entries[lastOccupiedBlock].starting_block + fatTable->entries[lastOccupiedBlock].num_blocks;
     }
 
-    // Update FAT table for the current file
+    // Update FAT table for the current file (including file size)
     int currentBlock = findEmptyFatEntry(fatTable);
     if (currentBlock == -1) {
         printf("Error: FAT table full\n");
@@ -133,6 +135,7 @@ void writeFileToTar(char *filename, FILE *tarFile, FatTable *fatTable) {
     fatTable->entries[currentBlock].starting_block = starting_block;
     fatTable->entries[currentBlock].num_blocks = num_blocks;
     strcpy(fatTable->entries[currentBlock].filename, filename);
+    fatTable->entries[currentBlock].file_size = file_size;
     int offset = 0;
 
     // Read file blocks and write them to the TAR file
@@ -171,9 +174,13 @@ void readTarFile(char *tarFilename) {
         return;
     }
 
+    // Calculate the offset after the FatTable and TarHeader
+    int offset = sizeof(FatTable) + sizeof(TarHeader);
+
     // Read and store the FAT table
     FatTable fatTable;
-    loadFatTableFromFile(&fatTable, tarFile);
+    fseek(tarFile, 0, SEEK_SET); // Rewind to the beginning of the file
+    fread(&fatTable, sizeof(FatTable), 1, tarFile);
 
     // Loop through each file entry in the TAR based on FAT table
     for (int i = 0; i < 256; i++) {
@@ -185,25 +192,44 @@ void readTarFile(char *tarFilename) {
         char filename[13]; // Account for null terminator
         strncpy(filename, fatTable.entries[i].filename, 12);
         filename[12] = '\0'; // Ensure null termination
-        int file_size = 0;
-        for (int j = 0; j < fatTable.entries[i].num_blocks; j++) {
-            file_size += BLOCK_SIZE;
-        }
+        int file_size = fatTable.entries[i].file_size;  // Use file size from FAT entry
         int starting_block = fatTable.entries[i].starting_block;
 
-        // Read file blocks and update FAT entry with block information
-        int currentBlock = starting_block;
-        char buffer[BLOCK_SIZE];
+        // Open output file for writing
         FILE *outFile = fopen(filename, "wb");
         if (!outFile) {
             printf("Error creating output file: %s\n", filename);
             continue;
         }
 
-        while (currentBlock < starting_block + fatTable.entries[i].num_blocks) {
-            fseek(tarFile, starting_block * BLOCK_SIZE, SEEK_SET);
-            fread(buffer, 1, BLOCK_SIZE, tarFile);
-            fwrite(buffer, 1, BLOCK_SIZE, outFile);
+        // Extract file data block by block
+        int bytes_read = 0;
+        int currentBlock = starting_block;
+        char buffer[BLOCK_SIZE];
+        while (bytes_read < file_size) {
+            // Calculate remaining bytes to read for the last block
+            int bytes_to_read = (file_size - bytes_read) < BLOCK_SIZE ? (file_size - bytes_read) : BLOCK_SIZE;
+
+            // Seek to the starting position of the current block, considering offset
+            fseek(tarFile, offset + starting_block * BLOCK_SIZE + bytes_read, SEEK_SET);
+
+            // Read data from the TAR file
+            int bytes_actually_read = fread(buffer, 1, bytes_to_read, tarFile);
+
+            // Check for read errors or unexpected end of file
+            if (bytes_actually_read < bytes_to_read && feof(tarFile)) {
+                printf("Error reading file: Unexpected end of file in block %d\n", currentBlock);
+                break;
+            } else if (bytes_actually_read != bytes_to_read) {
+                printf("Error reading file: Failed to read %d bytes from block %d\n", bytes_to_read, currentBlock);
+                break;
+            }
+
+            // Write data to the output file
+            fwrite(buffer, 1, bytes_actually_read, outFile);
+
+            // Update bytes read and current block
+            bytes_read += bytes_actually_read;
             currentBlock++;
         }
 
@@ -213,6 +239,7 @@ void readTarFile(char *tarFilename) {
 
     fclose(tarFile);
 }
+
 
 
 int main(int argc, char *argv[]) {
