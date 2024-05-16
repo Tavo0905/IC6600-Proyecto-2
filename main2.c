@@ -469,8 +469,60 @@ int main(int argc, char *argv[]) {
         // Implementar la función para actualizar el contenido del archivo TAR
         // printf("Actualizar contenido del archivo TAR: %s\n", tarFilename);
     } else if (append) {
-        // Implementar la función para agregar contenido a un archivo TAR
-        printf("Agregar contenido al archivo TAR: %s\n", tarFilename);
+        // Abrir el archivo TAR en modo de actualización ("rb+")
+        FILE *tarFile = fopen(tarFilename, "rb+");
+        if (!tarFile) {
+            printf("Error abriendo archivo TAR: %s\n", tarFilename);
+            return 1;
+        }
+
+        // Leer la FAT table del archivo TAR
+        FatTable fatTable;
+        loadFatTableFromFile(&fatTable, tarFile);
+
+        // Encontrar un conjunto de bloques libres seguidos para almacenar el archivo
+        int startingBlock = -1;
+        int numBlocksRequired = -1;
+        int lastOccupiedBlock = -1;
+        for (int i = 0; i < 256; i++) {
+            if (!fatTable.entries[i].is_empty) {
+                lastOccupiedBlock = i;
+            }
+            if (fatTable.entries[i].is_empty || i == lastOccupiedBlock + 1) {
+                int numConsecutiveEmptyBlocks = 1;
+                for (int j = i + 1; j < 256; j++) {
+                    if (fatTable.entries[j].is_empty) {
+                        numConsecutiveEmptyBlocks++;
+                        if (numConsecutiveEmptyBlocks >= numBlocksRequired) {
+                            startingBlock = i;
+                            numBlocksRequired = numConsecutiveEmptyBlocks;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Si se encontró un conjunto de bloques libres seguidos
+        if (startingBlock != -1 && numBlocksRequired != -1) {
+            // Iterar sobre los archivos adicionales para agregarlos al archivo TAR
+            for (int i = optind; i < argc; i++) {
+                // Agregar el archivo al archivo TAR
+                writeFileToTar(argv[i], tarFile, &fatTable);
+            }
+
+            // Guardar la FAT table actualizada en el archivo TAR
+            fseek(tarFile, 0, SEEK_SET);
+            saveFatTableToFile(&fatTable, tarFile);
+
+            fclose(tarFile);
+            printf("Archivo(s) agregado(s) a %s\n", tarFilename);
+        } else {
+            printf("No se encontró un conjunto de bloques libres seguidos para almacenar el archivo.\n");
+            fclose(tarFile);
+            return 1;
+        }
     } else if (pack) {
         // Implementar la función para desfragmentar contenido de un archivo TAR
         printf("Desfragmentar contenido del archivo TAR: %s\n", tarFilename);
