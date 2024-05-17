@@ -465,6 +465,60 @@ void updateFileFromTar(char *filename, char *tar_filename) {
     printf("Archivo modifocado en TAR: %s\n", filename);
 }
 
+void packTar(char *tar_filename) {
+    FILE *tarFile = fopen(tar_filename, "rb+");
+    if (!tarFile) {
+        printf("ERROR: No se encontro el archivo %s.\n", tar_filename);
+        return;
+    }
+
+    if (verbose > 0) {
+        printf("Archivo %s cargado correctamente.\n\n", tar_filename);
+    }
+
+    if (verbose == 2) {
+        printf("Extrayendo estructura FAT...\n");
+    }
+    // Read the FAT table from the TAR file
+    FatTable fatTable;
+    loadFatTableFromFile(&fatTable, tarFile);
+
+    // Variable to track the total size of empty blocks to be subtracted
+    int emptyBlockOffset = 0;
+
+    // Iterate through the FAT table to pack empty blocks
+    for (int i = 0; i < 256; i++) {
+        if (fatTable.entries[i].is_empty) {
+            // Add the block size of the empty entry to the offset
+            emptyBlockOffset += fatTable.entries[i].num_blocks;
+        } else {
+            // Adjust the first block of subsequent files after the empty space
+            fatTable.entries[i].starting_block -= emptyBlockOffset;
+        }
+    }
+
+    // Remove empty entries from the FAT table
+    int j = 0; // Index for non-empty entries
+    for (int i = 0; i < 256; i++) {
+        if (!fatTable.entries[i].is_empty) {
+            // Copy non-empty entry to the beginning of the FAT table
+            fatTable.entries[j] = fatTable.entries[i];
+            j++;
+        }
+    }
+    // Clear remaining entries in the FAT table
+    for (; j < 256; j++) {
+        memset(&fatTable.entries[j], 0, sizeof(FatEntry));
+    }
+
+    // Save the updated FAT table back to the TAR file
+    fseek(tarFile, 0, SEEK_SET); // Rewind to the beginning of the file
+    saveFatTableToFile(&fatTable, tarFile);
+
+    fclose(tarFile);
+
+    printf("\nArchivo TAR compactado exitosamente.\n\n");
+}
 
 int main(int argc, char *argv[]) {
     int opt;
@@ -473,7 +527,7 @@ int main(int argc, char *argv[]) {
     char *filename = NULL;
 
     // Procesar los argumentos de la línea de comandos
-    while ((opt = getopt(argc, argv, "cxtduvrf:")) != -1) {
+    while ((opt = getopt(argc, argv, "cxtduvrpf:")) != -1) {
         switch (opt) {
             case 'c':
                 create = 1;
@@ -487,11 +541,6 @@ int main(int argc, char *argv[]) {
             case 'd':
                 delete = 1;
                 break;
-            // case '-': // Manejar los flags largos (--delete)
-            //     if (strcmp(optarg, "delete") == 0) {
-            //         delete = 1;
-            //     }
-            //     break;
             case 'u':
                 update = 1;
                 break;
@@ -514,8 +563,8 @@ int main(int argc, char *argv[]) {
     }
 
     // Verificar la validez de las combinaciones de argumentos
-    if ((create + extract + list + delete + update + append) != 1) {
-        fprintf(stderr, "Debe especificar exactamente una operación (-c, -x, -t, --delete, -u, -r).\n");
+    if ((create + extract + list + delete + update + append + pack) != 1) {
+        fprintf(stderr, "Debe especificar exactamente una operación (-c, -x, -t, -d, -u, -r, -p).\n");
         return 1;
     }
 
@@ -557,8 +606,6 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            // printFatTable(&fatTable);
-
             // Guardar la FAT table actualizada en el archivo TAR
             fseek(tarFile, 0, SEEK_SET);
             saveFatTableToFile(&fatTable, tarFile);
@@ -590,12 +637,8 @@ int main(int argc, char *argv[]) {
         listTar(tarFilename);
     } else if (delete) {
         deleteFileFromTar(argv[optind], tarFilename);
-        // Implementar la función para borrar desde un archivo TAR
-        // printf("Borrar desde el archivo TAR: %s\n", tarFilename);
     } else if (update) {
         updateFileFromTar(argv[optind], tarFilename);
-        // Implementar la función para actualizar el contenido del archivo TAR
-        // printf("Actualizar contenido del archivo TAR: %s\n", tarFilename);
     } else if (append) {
         // Abrir el archivo TAR en modo de actualización ("rb+")
         FILE *tarFile = fopen(tarFilename, "rb+");
@@ -668,8 +711,7 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     } else if (pack) {
-        // Implementar la función para desfragmentar contenido de un archivo TAR
-        printf("Desfragmentar contenido del archivo TAR: %s\n", tarFilename);
+        packTar(tarFilename);
     }
 
     return 0;
