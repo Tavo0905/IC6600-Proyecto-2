@@ -1,230 +1,858 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <string.h>
 #include <bits/getopt_core.h>
 
-#include <errno.h>
-#include <sys/stat.h>
-#include <fcntl.h>
+#define BLOCK_SIZE 262144 // 256 kB block size
+int verbose = 0;
 
-#define FAT_ENTRY_SIZE 256 // Tamaño de cada entrada FAT (puede ajustarse según las necesidades)
-#define MAX_BLOCKS 1000 // Número máximo de bloques en el archivo TAR
-#define TAR_BLOCKSIZE (256 * 1024)
-
-typedef struct {
-    char filename[100]; // Nombre del archivo
-    off_t block_offset; // Desplazamiento del bloque de inicio dentro del archivo TAR
-    off_t block_count;  // Número de bloques ocupados por el archivo
+typedef struct FatEntry
+{
+    char filename[12];           // 12-character filename
+    unsigned int starting_block; // Starting block number of the file
+    unsigned int num_blocks;     // Number of blocks required for the file
+    unsigned int file_size;      // File size in bytes (added)
+    unsigned char is_empty;      // Empty flag (1 for empty, 0 for occupied)
 } FatEntry;
 
-void create_tar(char* tar_filename);
-void extract_tar(char* tar_filename);
-void list_tar(char* tar_filename);
-void delete_from_tar(char* tar_filename, char* file_to_delete);
-void update_tar(char* tar_filename, char** files_to_update);
-void append_to_tar(char* tar_filename, char* files[], int num_files);
-void pack_tar(char* tar_filename);
-void write_header(int tar_fd, const char *filename, off_t size);
-void write_file(int tar_fd, const char *filename, FatEntry *fat_entry);
-void write_fat_entries(int tar_fd, FatEntry *fat_entries, int num_entries);
-int calculate_file_blocks(const char* filename);
+typedef struct FatTable
+{
+    FatEntry entries[256]; // FAT table with 256 entries
+} FatTable;
 
-int main(int argc, char *argv[]) {
-    char* tar_filename = NULL;
-    char* files[argc];
-    int num_files = 0;
-    
-    // Variables para controlar qué opciones se han encontrado
-    int c_flag = 0;
-    int x_flag = 0;
-    int u_flag = 0;
-    int f_flag = 0;
-    
+typedef struct TarHeader
+{
+    char magic_number[6];       // Magic number to identify the TAR file
+    char version_number[2];     // Version number
+    char user_name[100];        // User name
+    char group_name[100];       // Group name
+    char modification_time[12]; // Modification time in octal
+    char checksum[8];           // Checksum for header integrity
+    char file_size[12];         // File size in bytes (in octal)
+    char block_size[12];        // Block size in bytes (in octal)
+    char linked_tar_file[100];  // Linked TAR file name
+    char prefix[155];           // Prefix for file names
+} TarHeader;
+
+void initializeFatTable(FatTable *fatTable)
+{
+    for (int i = 0; i < 256; i++)
+    {
+        fatTable->entries[i].is_empty = 1;
+        fatTable->entries[i].starting_block = 0;
+        fatTable->entries[i].num_blocks = 0;
+        strcpy(fatTable->entries[i].filename, "\0");
+        fatTable->entries[i].file_size = 0; // Initialize file size to 0 (added)
+    }
+}
+
+int findEmptyFatEntry(FatTable *fatTable)
+{
+    for (int i = 0; i < 256; i++)
+    {
+        if (fatTable->entries[i].is_empty)
+        {
+            return i;
+        }
+    }
+    return -1; // No empty entries found
+}
+
+void saveFatTableToFile(FatTable *fatTable, FILE *tarFile)
+{
+    fwrite(fatTable->entries, sizeof(FatEntry), 256, tarFile);
+}
+
+void loadFatTableFromFile(FatTable *fatTable, FILE *tarFile)
+{
+    fread(fatTable->entries, sizeof(FatEntry), 256, tarFile);
+}
+
+void printFatTable(FatTable *fatTable)
+{
+    printf("-------------------------------------------------------------------------------------\n");
+    printf("| %-20s | %-12s | %-12s | %-15s | %-10s |\n", "Filename", "First Block", "Block Size", "File Size", "Is Empty");
+    printf("|----------------------|--------------|--------------|-----------------|------------|\n");
+
+    for (int i = 0; i < 20; i++)
+    {
+        FatEntry entry = fatTable->entries[i];
+        printf("| %-20s | %12d | %12d | %15d | %10d |\n", entry.filename, entry.starting_block, entry.num_blocks, entry.file_size, entry.is_empty);
+    }
+    printf("-------------------------------------------------------------------------------------\n");
+}
+
+void createEmptyTar(char *tarFilename)
+{
+    FILE *tarFile = fopen(tarFilename, "wb");
+    if (!tarFile)
+    {
+        printf("ERROR: no se pudo crear el archivo %s\n", tarFilename);
+        exit(-1);
+    }
+
+    // Initialize an empty FAT table
+    FatTable fatTable;
+    initializeFatTable(&fatTable);
+
+    // Write the FAT table to the TAR file
+    saveFatTableToFile(&fatTable, tarFile);
+
+    // Write an empty TAR header (optional)
+    TarHeader tarHeader;
+    memset(&tarHeader, 0, sizeof(TarHeader)); // Set all header fields to 0
+    strcpy(tarHeader.magic_number, "ustar");  // Set magic number
+    fwrite(&tarHeader, sizeof(TarHeader), 1, tarFile);
+
+    fclose(tarFile);
+}
+
+void writeFileToTar(char *filename, FILE *tarFile, FatTable *fatTable)
+{
+    FILE *sourceFile = fopen(filename, "rb");
+    if (!sourceFile)
+    {
+        printf("ERROR: No se encontro el archivo %s\n", filename);
+        return;
+    }
+
+    if (verbose == 2)
+    {
+        printf("Obteniendo el tamano de %s...\n", filename);
+    }
+
+    // Get file size
+    fseek(sourceFile, 0, SEEK_END);
+    int file_size = ftell(sourceFile);
+    fseek(sourceFile, 0, SEEK_SET);
+
+    if (verbose == 2)
+    {
+        printf("Calculando la cantidad de bloques requeridos para %s...\n", filename);
+    }
+
+    // Calculate the number of blocks required
+    int num_blocks = (file_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    if (verbose == 2)
+    {
+        printf("Ajustando posiciones dentro del FAT...\n");
+    }
+
+    // Find the last occupied block of the previous file
+    int lastOccupiedBlock = -1;
+    for (int i = 0; i < 256; i++)
+    {
+        if (!fatTable->entries[i].is_empty && i < fatTable->entries[i].starting_block + fatTable->entries[i].num_blocks)
+        {
+            lastOccupiedBlock = i;
+        }
+    }
+
+    // Calculate the starting block for the current file
+    int starting_block;
+    if (lastOccupiedBlock == -1)
+    {
+        starting_block = 0; // No previous files, start from block 0
+    }
+    else
+    {
+        starting_block = fatTable->entries[lastOccupiedBlock].starting_block + fatTable->entries[lastOccupiedBlock].num_blocks;
+    }
+
+    // Update FAT table for the current file (including file size)
+    int currentBlock = findEmptyFatEntry(fatTable);
+    if (currentBlock == -1)
+    {
+        printf("ERROR: Se ha superado la cantidad maxima de datos.\n");
+        fclose(sourceFile);
+        return;
+    }
+
+    if (verbose == 2)
+    {
+        printf("Actualizando estructura FAT...\n");
+    }
+
+    fatTable->entries[currentBlock].is_empty = 0;
+    fatTable->entries[currentBlock].starting_block = starting_block;
+    fatTable->entries[currentBlock].num_blocks = num_blocks;
+    strcpy(fatTable->entries[currentBlock].filename, filename);
+    fatTable->entries[currentBlock].file_size = file_size;
+    int offset = 0;
+
+    if (verbose == 2)
+    {
+        printf("Leyendo el contenido del archivo...\n");
+    }
+    // Read file blocks and write them to the TAR file
+    char buffer[BLOCK_SIZE];
+    while (fread(buffer, 1, BLOCK_SIZE, sourceFile) > 0)
+    {
+        fwrite(buffer, 1, BLOCK_SIZE, tarFile);
+        offset += BLOCK_SIZE;
+
+        // Check if the current block is the last block
+        if (offset == file_size)
+        {
+            break;
+        }
+
+        // Update FAT table for the next block
+        currentBlock = findEmptyFatEntry(fatTable);
+        if (currentBlock == -1)
+        {
+            printf("ERROR: Se ha superado la cantidad maxima de datos.\n");
+            break;
+        }
+    }
+
+    fclose(sourceFile);
+    if (verbose == 2)
+    {
+        printf("Archivo agregado al TAR: %s, Tamaño: %d bytes, Bloques iniciales: %d, Bloques: %d\n", filename, file_size, fatTable->entries[currentBlock].starting_block, num_blocks);
+    }
+}
+
+void readTarFile(char *tarFilename)
+{
+    FILE *tarFile = fopen(tarFilename, "rb");
+    if (!tarFile)
+    {
+        printf("ERROR: No se encontro el archivo TAR: %s\n", tarFilename);
+        return;
+    }
+
+    if (verbose == 2)
+    {
+        printf("Archivo %s cargado conexito.\n\n", tarFilename);
+    }
+
+    // Calculate the offset after the FatTable and TarHeader
+    int offset = sizeof(FatTable) + sizeof(TarHeader);
+
+    // Read and store the FAT table
+    FatTable fatTable;
+    fseek(tarFile, 0, SEEK_SET); // Rewind to the beginning of the file
+    fread(&fatTable, sizeof(FatTable), 1, tarFile);
+
+    if (verbose == 2)
+    {
+        printf("Extrayendo estructura FAT...\n\n");
+    }
+
+    // Loop through each file entry in the TAR based on FAT table
+    for (int i = 0; i < 256; i++)
+    {
+        if (fatTable.entries[i].is_empty)
+        {
+            continue; // Skip empty FAT entries
+        }
+
+        // Extract file data based on FAT information
+        char filename[13]; // Account for null terminator
+        strncpy(filename, fatTable.entries[i].filename, 12);
+        filename[12] = '\0'; // Ensure null termination
+
+        int file_size = fatTable.entries[i].file_size; // Use file size from FAT entry
+        int starting_block = fatTable.entries[i].starting_block;
+
+        // Open output file for writing
+        FILE *outFile = fopen(filename, "wb");
+        if (!outFile)
+        {
+            printf("ERROR: no se pudo extraer el archivo %s\n", filename);
+            continue;
+        }
+
+        if (verbose == 2)
+        {
+            printf("Extrayendo el contenido del archivo %s.\n", filename);
+        }
+        // Extract file data block by block
+        int bytes_read = 0;
+        int currentBlock = starting_block;
+        char buffer[BLOCK_SIZE];
+        while (bytes_read < file_size)
+        {
+            // Calculate remaining bytes to read for the last block
+            int bytes_to_read = (file_size - bytes_read) < BLOCK_SIZE ? (file_size - bytes_read) : BLOCK_SIZE;
+
+            // Seek to the starting position of the current block, considering offset
+            fseek(tarFile, offset + starting_block * BLOCK_SIZE + bytes_read, SEEK_SET);
+
+            // Read data from the TAR file
+            int bytes_actually_read = fread(buffer, 1, bytes_to_read, tarFile);
+
+            // Check for read errors or unexpected end of file
+            if (bytes_actually_read < bytes_to_read && feof(tarFile))
+            {
+                printf("ERROR: EOF encontrado dentro del bloque %d.\n", currentBlock);
+                break;
+            }
+            else if (bytes_actually_read != bytes_to_read)
+            {
+                printf("ERROR: No se pudo leer los bytes %d del bloque %d.\n", bytes_to_read, currentBlock);
+                break;
+            }
+
+            // Write data to the output file
+            fwrite(buffer, 1, bytes_actually_read, outFile);
+
+            // Update bytes read and current block
+            bytes_read += bytes_actually_read;
+            currentBlock++;
+        }
+
+        fclose(outFile);
+        if (verbose == 1)
+        {
+            printf("Archivo extraído: %s\n", filename);
+        }
+        else if (verbose == 2)
+        {
+            printf("Archivo extraído: %s, Tamaño: %d bytes, Bloques iniciales: %d, Bloques: %d\n", filename, file_size, fatTable.entries[i].starting_block, fatTable.entries[i].num_blocks);
+        }
+    }
+
+    fclose(tarFile);
+
+    if (verbose == 2)
+    {
+        printf("\nArchivo TAR cerrado exitosamente.\n\n");
+    }
+}
+
+void listTar(char *tar_filename)
+{
+    FILE *tarFile = fopen(tar_filename, "rb");
+    if (!tarFile)
+    {
+        printf("ERROR: No se encontro el archivo %s.\n", tar_filename);
+        return;
+    }
+
+    if (verbose > 0)
+    {
+        printf("Archivo %s cargado conexito.\n\n", tar_filename);
+    }
+
+    if (verbose == 2)
+    {
+        printf("Extrayendo estructura FAT...\n");
+    }
+    // Read and store the FAT table
+    FatTable fatTable;
+    loadFatTableFromFile(&fatTable, tarFile);
+
+    if (verbose == 2)
+    {
+        printf("Imprimiendo tabla de archivos...\n");
+    }
+    printFatTable(&fatTable);
+    if (verbose == 2)
+    {
+        printf("Tabla de archivos desplegada con exito.\n");
+    }
+
+    fclose(tarFile);
+    if (verbose == 2)
+    {
+        printf("\nArchivo TAR cerrado exitosamente.\n\n");
+    }
+}
+
+void deleteFileFromTar(char *filename, char *tar_filename)
+{
+    FILE *tarFile = fopen(tar_filename, "rb+");
+    if (!tarFile)
+    {
+        printf("ERROR: No se encontro el archivo %s.\n", tar_filename);
+        return;
+    }
+
+    if (verbose > 0)
+    {
+        printf("Archivo %s cargado conexito.\n\n", tar_filename);
+    }
+
+    if (verbose == 2)
+    {
+        printf("Extrayendo estructura FAT...\n");
+    }
+    // Read and store the FAT table
+    FatTable fatTable;
+    loadFatTableFromFile(&fatTable, tarFile);
+
+    // Find the entry for the file in the FAT table
+    int fileIndex = -1;
+    for (int i = 0; i < 256; i++)
+    {
+        if (!fatTable.entries[i].is_empty && strcmp(fatTable.entries[i].filename, filename) == 0)
+        {
+            fileIndex = i;
+            break;
+        }
+    }
+
+    if (fileIndex == -1)
+    {
+        printf("ERROR: Archivo no encontrado dentro del TAR: %s\n", filename);
+        fclose(tarFile);
+        return;
+    }
+
+    if (verbose > 0)
+    {
+        printf("Eliminando archivo %s...\n", filename);
+    }
+    // Mark the entry as empty
+    fatTable.entries[fileIndex].is_empty = 1;
+    fatTable.entries[fileIndex].file_size = 0;
+    strcpy(fatTable.entries[fileIndex].filename, "");
+
+    // Update the FAT table in the TAR file
+    fseek(tarFile, 0, SEEK_SET); // Rewind to the beginning of the file
+    saveFatTableToFile(&fatTable, tarFile);
+
+    if (verbose == 2)
+    {
+        printf("Actualizando la estructura FAT...\n");
+    }
+
+    fclose(tarFile);
+    if (verbose == 2)
+    {
+        printf("\nArchivo TAR cerrado exitosamente.\n\n");
+    }
+    printf("Archivo eliminado del TAR: %s\n", filename);
+}
+
+void updateFileFromTar(char *filename, char *tar_filename)
+{
+    FILE *tarFile = fopen(tar_filename, "rb+");
+    if (!tarFile)
+    {
+        printf("ERROR: No se encontro el archivo %s.\n", tar_filename);
+        return;
+    }
+
+    if (verbose > 0)
+    {
+        printf("Archivo %s cargado conexito.\n\n", tar_filename);
+    }
+
+    if (verbose == 2)
+    {
+        printf("Extrayendo estructura FAT...\n");
+    }
+    // Read and store the FAT table
+    FatTable fatTable;
+    loadFatTableFromFile(&fatTable, tarFile);
+
+    if (verbose == 2)
+    {
+        printf("Buscando archivo: %s...\n", filename);
+    }
+    // Find the entry for the file in the FAT table
+    int fileIndex = -1;
+    for (int i = 0; i < 256; i++)
+    {
+        if (!fatTable.entries[i].is_empty && strcmp(fatTable.entries[i].filename, filename) == 0)
+        {
+            fileIndex = i;
+            break;
+        }
+    }
+
+    if (fileIndex == -1)
+    {
+        printf("ERROR: Archivo no encontrado dentro del TAR: %s\n", filename);
+        fclose(tarFile);
+        return;
+    }
+
+    if (verbose > 0)
+    {
+        printf("Actualizando informacion de: %s...\n", filename);
+    }
+    // Open the new version of the file for updating
+    FILE *newFile = fopen(filename, "rb");
+    if (!newFile)
+    {
+        printf("Error opening new version of the file: %s\n", filename);
+        fclose(tarFile);
+        return;
+    }
+
+    if (verbose == 2)
+    {
+        printf("Calculando la cantidad de bloques requeridos para %s...\n", filename);
+    }
+    // Calculate the number of blocks required for the new file
+    fseek(newFile, 0, SEEK_END);
+    int newFileSize = ftell(newFile);
+    fseek(newFile, 0, SEEK_SET);
+    int newNumBlocks = (newFileSize + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    // Compare the number of blocks with the original file
+    if (newNumBlocks != fatTable.entries[fileIndex].num_blocks)
+    {
+        printf("Error: The number of blocks of the new file does not match the number specified in the FAT table.\n");
+        fclose(newFile);
+        fclose(tarFile);
+        return;
+    }
+
+    // Calculate the starting block of the file
+    int startingBlock = fatTable.entries[fileIndex].starting_block;
+
+    if (verbose == 2)
+    {
+        printf("Ubicando el archivo dentro del TAR...\n");
+    }
+    // Move to the starting block in the TAR file
+    fseek(tarFile, sizeof(FatTable) + sizeof(TarHeader) + (startingBlock * BLOCK_SIZE), SEEK_SET);
+
+    // Update the content of the TAR file with the content of the new file
+    char buffer[BLOCK_SIZE];
+    int bytesRead;
+    while ((bytesRead = fread(buffer, 1, BLOCK_SIZE, newFile)) > 0)
+    {
+        fwrite(buffer, 1, bytesRead, tarFile);
+    }
+
+    if (verbose == 2)
+    {
+        printf("Actualizando la estructura FAT...\n");
+    }
+    // Update file size in the FAT table entry
+    fatTable.entries[fileIndex].file_size = newFileSize;
+
+    // Update the FAT table in the TAR file
+    fseek(tarFile, 0, SEEK_SET); // Rewind to the beginning of the file
+    saveFatTableToFile(&fatTable, tarFile);
+
+    fclose(newFile);
+    fclose(tarFile);
+
+    if (verbose == 2)
+    {
+        printf("\nArchivo TAR cerrado exitosamente.\n\n");
+    }
+
+    printf("Archivo modifocado en TAR: %s\n", filename);
+}
+
+void packTar(char *tar_filename)
+{
+    FILE *tarFile = fopen(tar_filename, "rb+");
+    if (!tarFile)
+    {
+        printf("ERROR: No se encontro el archivo %s.\n", tar_filename);
+        return;
+    }
+
+    if (verbose > 0)
+    {
+        printf("Archivo %s cargado correctamente.\n\n", tar_filename);
+    }
+
+    if (verbose == 2)
+    {
+        printf("Extrayendo estructura FAT...\n");
+    }
+    // Read the FAT table from the TAR file
+    FatTable fatTable;
+    loadFatTableFromFile(&fatTable, tarFile);
+
+    // Variable to track the total size of empty blocks to be subtracted
+    int emptyBlockOffset = 0;
+
+    // Iterate through the FAT table to pack empty blocks
+    for (int i = 0; i < 256; i++)
+    {
+        if (fatTable.entries[i].is_empty)
+        {
+            // Add the block size of the empty entry to the offset
+            emptyBlockOffset += fatTable.entries[i].num_blocks;
+        }
+        else
+        {
+            // Adjust the first block of subsequent files after the empty space
+            fatTable.entries[i].starting_block -= emptyBlockOffset;
+        }
+    }
+
+    // Remove empty entries from the FAT table
+    int j = 0; // Index for non-empty entries
+    for (int i = 0; i < 256; i++)
+    {
+        if (!fatTable.entries[i].is_empty)
+        {
+            // Copy non-empty entry to the beginning of the FAT table
+            fatTable.entries[j] = fatTable.entries[i];
+            j++;
+        }
+    }
+    // Clear remaining entries in the FAT table
+    for (; j < 256; j++)
+    {
+        memset(&fatTable.entries[j], 0, sizeof(FatEntry));
+    }
+
+    // Save the updated FAT table back to the TAR file
+    fseek(tarFile, 0, SEEK_SET); // Rewind to the beginning of the file
+    saveFatTableToFile(&fatTable, tarFile);
+
+    fclose(tarFile);
+
+    printf("\nArchivo TAR compactado exitosamente.\n\n");
+}
+
+int main(int argc, char *argv[])
+{
     int opt;
-    while ((opt = getopt(argc, argv, "cxtruf:p")) != -1) {
-        switch (opt) {
-            case 'c':
-                c_flag = 1;
-                break;
-            case 'x':
-                x_flag = 1;
-                break;
-            case 't':
-                // Implementar función para el flag -t
-                break;
-            case 'r':
-                // Implementar función para el flag -r
-                break;
-            case 'u':
-                u_flag = 1;
-                break;
-            case 'f':
-                f_flag = 1;
-                break;
-            case 'p':
-                // Implementar función para el flag -p
-                break;
-            default:
-                fprintf(stderr, "Uso: %s [-cxtur] [-f archivo_tar] [-p] [archivo...]\n", argv[0]);
-                exit(EXIT_FAILURE);
+    int create = 0, extract = 0, list = 0, delete = 0, update = 0, append = 0, pack = 0;
+    char *tarFilename = NULL;
+    char *filename = NULL;
+
+    // Procesar los argumentos de la línea de comandos
+    while ((opt = getopt(argc, argv, "cxtduvrpf:")) != -1)
+    {
+        switch (opt)
+        {
+        case 'c':
+            create = 1;
+            break;
+        case 'x':
+            extract = 1;
+            break;
+        case 't':
+            list = 1;
+            break;
+        case 'd':
+            delete = 1;
+            break;
+        case 'u':
+            update = 1;
+            break;
+        case 'v':
+            verbose++;
+            break;
+        case 'r':
+            append = 1;
+            break;
+        case 'p':
+            pack = 1;
+            break;
+        case 'f':
+            tarFilename = optarg;
+            break;
+        default:
+            fprintf(stderr, "Uso: %s [-cxtdurv] [-f archivo_tar] [archivo(s)]\n", argv[0]);
+            return 1;
         }
-        tar_filename = optarg;
     }
-    
-    // Si se encontró el flag -f, procesar los archivos
-    if (f_flag) {
-        for (int i = optind; i < argc; i++) {
-            files[num_files++] = argv[i];
+
+    // Verificar la validez de las combinaciones de argumentos
+    if ((create + extract + list + delete +update + append + pack) != 1)
+    {
+        fprintf(stderr, "Debe especificar exactamente una operación (-c, -x, -t, -d, -u, -r, -p).\n");
+        return 1;
+    }
+
+    // Ejecutar la operación especificada
+    if (create)
+    {
+
+        if (verbose > 0)
+        {
+            printf("Creando archivo TAR...\n");
+        }
+        createEmptyTar(tarFilename);
+
+        if (verbose == 2)
+        {
+            printf("Archivo TAR creado.\n\n");
+            printf("Agregando archivos seleccionados...\n");
+        }
+
+        // Si hay archivos adicionales para agregar al archivo TAR recién creado
+        if (optind < argc)
+        {
+            // Abrir el archivo TAR en modo de actualización ("rb+")
+            FILE *tarFile = fopen(tarFilename, "rb+");
+            if (!tarFile)
+            {
+                printf("Error abriendo archivo TAR: %s\n", tarFilename);
+                return 1;
+            }
+
+            // Leer la FAT table del archivo TAR
+            FatTable fatTable;
+            loadFatTableFromFile(&fatTable, tarFile);
+            if (verbose == 2)
+            {
+                printf("Extrayendo estructura FAT...\n");
+            }
+
+            // Iterar sobre los archivos adicionales para agregarlos al archivo TAR
+            for (int i = optind; i < argc; i++)
+            {
+                // Agregar el archivo al archivo TAR
+                writeFileToTar(argv[i], tarFile, &fatTable);
+                if (verbose == 1)
+                {
+                    printf("Archivo agregado al TAR: %s\n", argv[i]);
+                }
+            }
+
+            // Guardar la FAT table actualizada en el archivo TAR
+            fseek(tarFile, 0, SEEK_SET);
+            saveFatTableToFile(&fatTable, tarFile);
+            if (verbose == 2)
+            {
+                printf("Actualizando la estructura FAT...\n\n");
+            }
+
+            fclose(tarFile);
+            if (verbose == 2)
+            {
+                printf("\nArchivo TAR cerrado exitosamente.\n\n");
+            }
+            if (verbose > 0)
+            {
+                printf("Archivos agregados a %s\n", tarFilename);
+            }
+        }
+        else
+        {
+            if (verbose > 0)
+            {
+                printf("Archivo TAR creado: %s\n", tarFilename);
+            }
         }
     }
-    
-    // Llamar a las funciones en el orden en que se encontraron los flags
-    if (c_flag)
-        create_tar(tar_filename);
-    if (x_flag)
-        extract_tar(tar_filename);
-    if (u_flag)
-        update_tar(tar_filename, files);
-    if (f_flag)
-        append_to_tar(tar_filename, files, num_files);
+    else if (extract)
+    {
+        if (verbose > 0)
+        {
+            printf("Extrayendo archivos de: %s\n\n", tarFilename);
+        }
+        readTarFile(tarFilename);
+        if (verbose > 0)
+        {
+            printf("Archivos extraidos de: %s\n\n", tarFilename);
+        }
+    }
+    else if (list)
+    {
+        listTar(tarFilename);
+    }
+    else if (delete)
+    {
+        deleteFileFromTar(argv[optind], tarFilename);
+    }
+    else if (update)
+    {
+        updateFileFromTar(argv[optind], tarFilename);
+    }
+    else if (append)
+    {
+        // Abrir el archivo TAR en modo de actualización ("rb+")
+        FILE *tarFile = fopen(tarFilename, "rb+");
+        if (!tarFile)
+        {
+            printf("Error abriendo archivo TAR: %s\n", tarFilename);
+            return 1;
+        }
+
+        if (verbose > 0)
+        {
+            printf("Archivo %s cargado conexito.\n\n", tarFilename);
+        }
+
+        if (verbose == 2)
+        {
+            printf("Extrayendo estructura FAT...\n");
+        }
+        // Leer la FAT table del archivo TAR
+        FatTable fatTable;
+        loadFatTableFromFile(&fatTable, tarFile);
+
+        if (verbose == 2)
+        {
+            printf("Encontrando un espacio libre...\n");
+        }
+        // Encontrar un conjunto de bloques libres seguidos para almacenar el archivo
+        int startingBlock = -1;
+        int numBlocksRequired = -1;
+        int lastOccupiedBlock = -1;
+        for (int i = 0; i < 256; i++)
+        {
+            if (!fatTable.entries[i].is_empty)
+            {
+                lastOccupiedBlock = i;
+            }
+            if (fatTable.entries[i].is_empty || i == lastOccupiedBlock + 1)
+            {
+                int numConsecutiveEmptyBlocks = 1;
+                for (int j = i + 1; j < 256; j++)
+                {
+                    if (fatTable.entries[j].is_empty)
+                    {
+                        numConsecutiveEmptyBlocks++;
+                        if (numConsecutiveEmptyBlocks >= numBlocksRequired)
+                        {
+                            startingBlock = i;
+                            numBlocksRequired = numConsecutiveEmptyBlocks;
+                        }
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (verbose == 2)
+        {
+            printf("Ubicando archivo dentro de TAR...\n");
+        }
+        // Si se encontró un conjunto de bloques libres seguidos
+        if (startingBlock != -1 && numBlocksRequired != -1)
+        {
+            // Iterar sobre los archivos adicionales para agregarlos al archivo TAR
+            for (int i = optind; i < argc; i++)
+            {
+                // Agregar el archivo al archivo TAR
+                writeFileToTar(argv[i], tarFile, &fatTable);
+            }
+
+            if (verbose == 2)
+            {
+                printf("Actualizando la estructura FAT...\n\n");
+            }
+            // Guardar la FAT table actualizada en el archivo TAR
+            fseek(tarFile, 0, SEEK_SET);
+            saveFatTableToFile(&fatTable, tarFile);
+
+            fclose(tarFile);
+            printf("Archivo(s) agregado(s) a %s\n", tarFilename);
+        }
+        else
+        {
+            printf("No se encontró un conjunto de bloques libres seguidos para almacenar el archivo.\n");
+            fclose(tarFile);
+            return 1;
+        }
+    }
+    else if (pack)
+    {
+        packTar(tarFilename);
+    }
 
     return 0;
-}
-
-void create_tar(char* tar_filename) {
-    // Crea un archivo tar vacío
-    int tar_fd = open(tar_filename, O_WRONLY | O_CREAT, 0644);
-    if (tar_fd < 0) {
-        fprintf(stderr, "Error creando el archivo TAR '%s': %s\n", tar_filename, strerror(errno));
-        exit(EXIT_FAILURE);
-    }
-    close(tar_fd);
-    printf("Archivo TAR '%s' creado exitosamente\n", tar_filename);
-}
-
-
-void extract_tar(char* tar_filename) {
-    // Implementar la extracción de un archivo TAR
-}
-
-void list_tar(char* tar_filename) {
-    // Implementar la lista de un archivo TAR
-}
-
-void delete_from_tar(char* tar_filename, char* file_to_delete) {
-    // Implementar la eliminación de un archivo de un archivo TAR
-}
-
-void update_tar(char* tar_filename, char** file_to_update) {
-    // Implementar la actualización de un archivo en un archivo TAR
-}
-
-void append_to_tar(char* tar_filename, char* files[], int num_files) {
-    int tar_fd = open(tar_filename, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (tar_fd < 0) {
-        fprintf(stderr, "Error opening TAR file '%s': %s\n", tar_filename, strerror(errno));
-        exit(EXIT_FAILURE);
-    }
-
-    // Calculate total blocks needed for all files
-    off_t total_blocks = 0;
-    for (int i = 0; i < num_files; i++) {
-        int file_blocks = calculate_file_blocks(files[i]);
-        total_blocks += file_blocks;
-    }
-
-    // Check if total blocks exceed the maximum
-    if (total_blocks > MAX_BLOCKS) {
-        fprintf(stderr, "Error: Total blocks (%lld) exceed maximum allowed (%d)\n", total_blocks, MAX_BLOCKS);
-        exit(EXIT_FAILURE);
-    }
-
-    // Allocate and initialize FAT entries
-    FatEntry fat_entries[num_files];
-    off_t current_offset = 0; // Offset for the first file block
-    for (int i = 0; i < num_files; i++) {
-        fat_entries[i].block_count = calculate_file_blocks(files[i]);
-        fat_entries[i].block_offset = current_offset;
-        current_offset += fat_entries[i].block_count;
-    }
-
-    // Write FAT entries at the beginning of the TAR archive
-    lseek(tar_fd, 0, SEEK_SET); // Move to the beginning of the file
-    write_fat_entries(tar_fd, fat_entries, num_files);
-
-    // Now append actual file data with headers
-    for (int i = 0; i < num_files; i++) {
-        write_file(tar_fd, files[i], &fat_entries[i]);
-    }
-
-    close(tar_fd);
-    printf("Files added to TAR archive '%s' successfully\n", tar_filename);
-}
-
-void pack_tar(char* tar_filename) {
-    // Implementar la desfragmentación de un archivo TAR
-}
-
-void write_header(int tar_fd, const char *filename, off_t size) {
-    char header[TAR_BLOCKSIZE];
-    memset(header, 0, TAR_BLOCKSIZE);
-    snprintf(header, TAR_BLOCKSIZE, "%s", filename);
-    snprintf(header + 124, 12, "%011o", (unsigned int)size);
-    write(tar_fd, header, TAR_BLOCKSIZE);
-}
-
-void write_file(int tar_fd, const char *filename, FatEntry *fat_entry) {
-    int file_fd = open(filename, O_RDONLY);
-    if (file_fd < 0) {
-        fprintf(stderr, "Error opening file '%s': %s\n", filename, strerror(errno));
-        exit(EXIT_FAILURE);
-    }
-
-    struct stat st;
-    stat(filename, &st);
-    off_t file_size = st.st_size;
-
-    write_header(tar_fd, filename, file_size);
-
-    char buffer[TAR_BLOCKSIZE];
-    ssize_t bytes_read;
-    off_t total_bytes_written = 0;
-    off_t block_count = 0;
-    while ((bytes_read = read(file_fd, buffer, TAR_BLOCKSIZE)) > 0) {
-        write(tar_fd, buffer, bytes_read);
-        total_bytes_written += bytes_read;
-        block_count++;
-    }
-
-    int padding_size = TAR_BLOCKSIZE - (file_size % TAR_BLOCKSIZE);
-    if (padding_size != TAR_BLOCKSIZE) {
-        char padding[TAR_BLOCKSIZE];
-        memset(padding, 0, TAR_BLOCKSIZE);
-        write(tar_fd, padding, padding_size);
-        block_count++;
-    }
-
-    fat_entry->block_count = block_count; // Set actual block count
-    close(file_fd);
-}
-
-
-void write_fat_entries(int tar_fd, FatEntry *fat_entries, int num_entries) {
-    char entry_info[256];
-    for (int i = 0; i < num_entries; i++) {
-        snprintf(entry_info, 256, "%lld %lld\n", fat_entries[i].block_offset, fat_entries[i].block_count);
-        write(tar_fd, entry_info, strlen(entry_info));
-    }
-}
-
-int calculate_file_blocks(const char* filename) {
-    struct stat st;
-    if (stat(filename, &st) == -1) {
-        fprintf(stderr, "Error getting file size for '%s': %s\n", filename, strerror(errno));
-        exit(EXIT_FAILURE);
-    }
-
-    off_t file_size = st.st_size;
-    return (file_size + TAR_BLOCKSIZE - 1) / TAR_BLOCKSIZE; // Round up for padding
 }
